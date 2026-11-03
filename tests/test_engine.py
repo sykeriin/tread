@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from tread.blend import prefill_kv, rotate_keys
+from tread.blend import assemble, prefill_kv, rotate_keys, to_cache
 from tread.engine import Engine, prefill_full
 from tread.store import BlockStore
 
@@ -111,6 +111,22 @@ def test_cuda_graph_blend_matches_eager(mt, req, policy, ratio):
     if ratio == 1.0:
         ref, _, _ = prefill_full(model, prefix, docs[::-1], query)
         assert kl(ref, b) < 1e-4
+
+
+@torch.inference_mode()
+def test_batched_cold_path_matches_per_doc_prefill(mt, req):
+    """All misses prefilled in one packed forward == each doc prefilled separately after the prefix."""
+    model, _ = mt
+    prefix, docs, query = req
+    K_ref, V_ref = assemble(model, prefix, docs, "shared")
+    ref = model(query[None], past_key_values=to_cache(K_ref, V_ref)).logits[0, -1]
+    eng = Engine(model, BlockStore(1 << 30))
+    out, cache, st = eng.prefill(prefix, docs, query)
+    assert st.misses == 1 + len(docs)
+    T = len(prefix) + sum(len(d) for d in docs)
+    for l in (0, len(K_ref) // 2, len(K_ref) - 1):
+        assert torch.allclose(cache.key_cache[l][:, :, :T], K_ref[l], atol=1e-3)
+    assert kl(ref, out) < 1e-5
 
 
 @torch.inference_mode()

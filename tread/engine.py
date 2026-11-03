@@ -56,23 +56,43 @@ class Engine:
         return key, b
 
     @torch.inference_mode()
-    def doc_block(self, prefix_key, pb, doc_ids, st):
-        key = block_key(*self.sig, prefix_key, doc_ids)
-        b = self.store.get(key)
-        if b is None:
-            st.misses += 1
-            st.tokens_prefilled += len(doc_ids)
-            # Prefill the doc on top of the cached prefix KV: the prefix is not recomputed.
-            pkv = self.model.model(doc_ids[None], past_key_values=to_cache(pb.K.unbind(0), pb.V.unbind(0)),
-                                   use_cache=True).past_key_values
-            P = pb.n_tokens
-            K = torch.stack(pkv.key_cache)[..., P:, :].contiguous()
-            V = torch.stack(pkv.value_cache)[..., P:, :].contiguous()
-            b = self.store.put(key, K, V, P) or _Tmp(K, V, P)
-        else:
-            st.hits += 1
-            st.tokens_reused += len(doc_ids)
-        return b
+    def doc_blocks(self, prefix_key, pb, docs, st):
+        """Look up every doc's block; prefill all misses together in one forward.
+
+        Missed docs are packed into one sequence on top of the cached prefix KV, with a block-diagonal
+        mask (each doc sees the prefix and itself, never another doc) and positions restarting at P
+        for each doc. That is exactly the per-doc prefill, in one launch sequence instead of one per doc.
+        """
+        keys = [block_key(*self.sig, prefix_key, d) for d in docs]
+        blocks = [self.store.get(k) for k in keys]
+        miss = [i for i, b in enumerate(blocks) if b is None]
+        st.hits += len(docs) - len(miss)
+        st.tokens_reused += sum(len(d) for d, b in zip(docs, blocks) if b is not None)
+        if not miss:
+            return blocks
+        st.misses += len(miss)
+        P = pb.n_tokens
+        ids = torch.cat([docs[i] for i in miss])
+        n, dev = len(ids), ids.device
+        seg = torch.cat([torch.full((len(docs[i]),), j, device=dev) for j, i in enumerate(miss)])
+        local = torch.cat([torch.arange(len(docs[i]), device=dev) for i in miss])
+        st.tokens_prefilled += n
+        # Additive 4D mask over [prefix | packed docs]: HF 4.46 passes a 4D mask through unchanged.
+        allowed = torch.ones(n, P + n, dtype=torch.bool, device=dev)
+        allowed[:, P:] = (seg[:, None] == seg[None, :]) & (local[:, None] >= local[None, :])
+        mask = torch.zeros(1, 1, n, P + n, dtype=self.model.dtype, device=dev)
+        mask.masked_fill_(~allowed, torch.finfo(self.model.dtype).min)
+        pkv = self.model.model(ids[None], past_key_values=to_cache(pb.K.unbind(0), pb.V.unbind(0)),
+                               attention_mask=mask, position_ids=(P + local)[None],
+                               cache_position=torch.arange(P, P + n, device=dev), use_cache=True).past_key_values
+        Kall, Vall = torch.stack(pkv.key_cache)[..., P:, :], torch.stack(pkv.value_cache)[..., P:, :]
+        off = 0
+        for i in miss:
+            L = len(docs[i])
+            K, V = Kall[..., off:off + L, :].contiguous(), Vall[..., off:off + L, :].contiguous()
+            blocks[i] = self.store.put(keys[i], K, V, P) or _Tmp(K, V, P)
+            off += L
+        return blocks
 
     @torch.inference_mode()
     def prefill(self, prefix_ids, docs, query_ids, ratio=0.0, policy="deviation"):
@@ -88,8 +108,7 @@ class Engine:
         Ks, Vs = [pb.K], [pb.V]
         offset = pb.n_tokens
         cands = []
-        for d in docs:
-            b = self.doc_block(pkey, pb, d, st)
+        for d, b in zip(docs, self.doc_blocks(pkey, pb, docs, st)):
             Ks.append(rotate_keys(self.model, b.K, offset - b.base))  # all layers in one op
             Vs.append(b.V)
             cands.append(torch.arange(offset, offset + len(d), device=d.device))
