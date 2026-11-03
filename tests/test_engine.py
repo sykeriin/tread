@@ -130,6 +130,25 @@ def test_batched_cold_path_matches_per_doc_prefill(mt, req):
 
 
 @torch.inference_mode()
+def test_cpu_tier_offloads_and_serves_hits(mt, req):
+    """With a tiny GPU budget, evicted blocks go to pinned CPU and still hit (and stay exact)."""
+    model, _ = mt
+    prefix, docs, query = req
+    probe = BlockStore(1 << 30)
+    Engine(model, probe).prefill(prefix, docs, query)
+    one_block = max(b.nbytes for b in probe.blocks.values())
+    store = BlockStore(2 * one_block, cpu_budget_bytes=1 << 30)
+    eng = Engine(model, store)
+    eng.prefill(prefix, docs, query)
+    assert store.stats.offloads > 0 and store.stats.bytes_used <= store.budget
+    assert store.stats.cpu_evictions == 0
+    warm, _, st = eng.prefill(prefix, docs[::-1], query)
+    assert st.misses == 0 and store.stats.cpu_hits > 0
+    cold, _, _ = Engine(model, BlockStore(1 << 30)).prefill(prefix, docs[::-1], query)
+    assert kl(cold, warm) < 1e-5
+
+
+@torch.inference_mode()
 def test_block_key_depends_on_prefix(mt, req):
     """The same doc after a different prefix must not hit: its KV depends on the prefix."""
     model, tok = mt
