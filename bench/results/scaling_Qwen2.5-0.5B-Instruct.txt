@@ -1,0 +1,14 @@
+model=Qwen/Qwen2.5-0.5B-Instruct dtype=float16 n=13 per length, reps=3
+ target    ctx            full    prefix_cache            cold      tread_r0.0      tread_r0.2      tread_r0.5
+   1000   1054      96ms 1.00x     104ms 0.92x     722ms 0.13x      95ms 1.01x     194ms 0.49x     189ms 0.51x
+   2000   2072     180ms 1.00x     212ms 0.85x    1211ms 0.15x      97ms 1.85x     193ms 0.93x     218ms 0.83x
+   4000   4059     364ms 1.00x     497ms 0.73x    2198ms 0.17x     116ms 3.14x     257ms 1.42x     400ms 0.91x
+   8000   8087     841ms 1.00x    1494ms 0.56x    3915ms 0.21x     146ms 5.77x     516ms 1.63x     938ms 0.90x
+  16000  16079    2162ms 1.00x   18476ms 0.12x    8537ms 0.25x     235ms 9.21x    1809ms 1.20x    9674ms 0.22x
+
+first-token top-1 agreement with full prefill
+   1000           1.000           1.000           0.538           0.692           0.846           0.692
+   2000           1.000           1.000           0.385           0.462           0.692           0.692
+   4000           1.000           1.000           0.231           0.462           0.923           0.923
+   8000           1.000           1.000           0.231           0.154           0.846           0.923
+  16000           1.000           1.000           0.231           0.308           0.769           0.923

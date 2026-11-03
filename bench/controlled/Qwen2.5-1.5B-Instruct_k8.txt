@@ -1,0 +1,15 @@
+model=Qwen/Qwen2.5-1.5B-Instruct dtype=float16 k=8 n=13 ctx tokens median=1158
+method          TTFT p50      p95  speedup  prefilled   eff       KL   top1
+full            2746.6ms 2937.1ms    1.00x       1118  0.00   0.0000  1.000
+prefix_cache    2882.7ms 3553.9ms    0.95x       1096  0.00   0.0001  1.000
+cold            1118.8ms 1472.2ms    2.45x       1096  0.00   1.6377  0.385
+tread_r0.0       106.3ms  126.6ms   25.83x          0  0.00   0.9424  0.538
+tread_r0.1       346.2ms  475.3ms    7.93x          0  0.13   0.9680  0.615
+tread_r0.2       458.2ms  595.6ms    5.99x          0  0.23   1.0568  0.462
+tread_r0.3       522.9ms  789.5ms    5.25x          0  0.32   0.8668  0.692
+tread_r0.5       814.1ms 2137.2ms    3.37x          0  0.52   0.1547  0.846
+r=0.1: worse than plain reuse on 7/13 requests
+r=0.2: worse than plain reuse on 5/13 requests
+r=0.3: worse than plain reuse on 5/13 requests
+r=0.5: worse than plain reuse on 0/13 requests
+store: 72 blocks, 254 MiB, hits=3464 misses=121 evictions=49
