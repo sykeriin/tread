@@ -66,6 +66,56 @@ class LockedTokenizer:
             return self.tok.decode(ids)
 
 
+class BodyLimit:
+    """Pure-ASGI cap on request body size, enforced on the bytes actually received.
+
+    A declared Content-Length is only an early reject: different HTTP parsers (h11, httptools) and proxies can
+    disagree about framing when both Content-Length and Transfer-Encoding are present, so the cap must not rely
+    on the header. Chunked uploads are refused outright (411); a POST must declare its length.
+
+    The body is buffered here, up to `max_body`, and replayed to the app. Raising from `receive` instead would be
+    caught by FastAPI's body parsing and surface as a generic 400, so the client would not see a 413.
+    """
+
+    def __init__(self, app, max_body):
+        self.app, self.max_body = app, max_body
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "POST":
+            return await self.app(scope, receive, send)
+        headers = dict(scope["headers"])
+        n = headers.get(b"content-length")
+        if b"transfer-encoding" in headers or n is None:
+            return await JSONResponse({"detail": "Content-Length required, chunked uploads are not accepted"},
+                                      status_code=411)(scope, receive, send)
+        if not n.isdigit() or int(n) > self.max_body:
+            return await JSONResponse({"detail": f"body exceeds {self.max_body} bytes"},
+                                      status_code=413)(scope, receive, send)
+        chunks, received = [], 0
+        while True:
+            msg = await receive()
+            if msg["type"] != "http.request":  # client went away mid-upload
+                return
+            body = msg.get("body", b"")
+            received += len(body)
+            if received > self.max_body:  # stop reading as soon as the cap is crossed
+                return await JSONResponse({"detail": f"body exceeds {self.max_body} bytes"},
+                                          status_code=413)(scope, receive, send)
+            chunks.append(body)
+            if not msg.get("more_body"):
+                break
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": b"".join(chunks), "more_body": False}
+            return await receive()  # later calls: disconnect notification
+
+        await self.app(scope, replay, send)
+
+
 # A token covers at least one character in any sane vocabulary and ~4 on English text; 32 is a loose upper
 # bound on chars/token that still rejects multi-megabyte inputs before they are tokenized.
 MAX_CHARS_PER_TOKEN = 32
@@ -82,16 +132,7 @@ def build_app(model, tok, engine: Engine, eos_ids, max_context=16384):
     max_chars = max_context * MAX_CHARS_PER_TOKEN
     max_body = max_chars * MAX_BODY_BYTES_PER_CHAR + (1 << 16)
 
-    @app.middleware("http")
-    async def cap_body(request, call_next):
-        # Reject on the declared length before the body is read or parsed. Chunked uploads (no length) are refused.
-        if request.method == "POST":
-            n = request.headers.get("content-length")
-            if n is None:
-                return JSONResponse({"detail": "Content-Length required"}, status_code=411)
-            if not n.isdigit() or int(n) > max_body:
-                return JSONResponse({"detail": f"body exceeds {max_body} bytes"}, status_code=413)
-        return await call_next(request)
+    app.add_middleware(BodyLimit, max_body=max_body)
 
     def tokenize(req):
         """All segments to token-id lists, with every size limit enforced before any tensor is allocated."""

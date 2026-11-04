@@ -162,3 +162,110 @@ def test_rejects_oversized_requests(client):
 def test_rejects_bad_policy(client):
     r = client.post("/v1/completions", json=dict(prefix=PREFIX, documents=DOCS, suffix=SUFFIX, policy="nope"))
     assert r.status_code == 422
+
+
+@pytest.fixture(scope="module")
+def live_small_server(small_client):
+    """The small-context app behind a real uvicorn/h11 server: TestClient does not exercise HTTP framing."""
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(small_client.app, host="127.0.0.1", port=port, log_level="error"))
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.1)
+    yield port
+    server.should_exit = True
+    t.join(timeout=10)
+
+
+def raw_post(port, head_lines, body=b""):
+    """Send a hand-built HTTP/1.1 request; return the status code (0 if the server just closed)."""
+    import socket
+
+    req = ("POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+           + "".join(h + "\r\n" for h in head_lines) + "Connection: close\r\n\r\n").encode() + body
+    with socket.create_connection(("127.0.0.1", port), timeout=20) as s:
+        try:
+            s.sendall(req)
+        except OSError:
+            pass  # server may reject and close mid-upload
+        data = b""
+        try:
+            while b"\r\n" not in data:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            pass
+    return int(data.split(b" ")[1]) if data.startswith(b"HTTP/1.1 ") else 0
+
+
+def chunked(payload: bytes, size=16384):
+    out = b"".join(b"%x\r\n" % len(payload[i:i + size]) + payload[i:i + size] + b"\r\n"
+                   for i in range(0, len(payload), size))
+    return out + b"0\r\n\r\n"
+
+
+def test_live_framing_attacks_cannot_bypass_the_body_cap(live_small_server):
+    big = b'{"prefix":"' + b"a" * 400_000 + b'","suffix":"b"}'  # far over the ~115 KB cap
+    small = b'{"prefix":"a","suffix":"b"}'
+    # Honest oversized upload.
+    assert raw_post(live_small_server, [f"Content-Length: {len(big)}"], big) == 413
+    # Declared length small, chunked body huge: the header must not be what the cap trusts.
+    status = raw_post(live_small_server, ["Content-Length: 10", "Transfer-Encoding: chunked"], chunked(big))
+    assert status in (400, 411, 413), status
+    # Chunked with no Content-Length.
+    assert raw_post(live_small_server, ["Transfer-Encoding: chunked"], chunked(big)) in (400, 411, 413)
+    # A normal small request still works afterwards (the server survived all of the above).
+    assert raw_post(live_small_server, [f"Content-Length: {len(small)}"], small) in (200, 413, 422)
+
+
+def test_request_with_no_documents_works(client):
+    """Regression: documents=[] with the default recompute_ratio crashed in blend() with a 500."""
+    r = client.post("/v1/completions", json=dict(prefix=PREFIX, suffix=SUFFIX, max_tokens=8))
+    assert r.status_code == 200, r.text
+    assert r.json()["tread"]["tokens_reused"] >= 0
+
+
+def test_body_cap_counts_received_bytes_not_the_header(small_client):
+    """A lying Content-Length must not matter: drive the ASGI app directly, bypassing any HTTP parser."""
+    import asyncio
+
+    max_body = 256 * 32 * 6 + (1 << 16)
+    chunk = b"x" * 20_000
+    n_chunks = max_body // len(chunk) + 3  # comfortably over the cap
+    sent = []
+
+    async def drive():
+        i = 0
+
+        async def receive():
+            nonlocal i
+            i += 1
+            return {"type": "http.request", "body": chunk, "more_body": i < n_chunks}
+
+        async def send(msg):
+            sent.append(msg)
+
+        scope = {"type": "http", "method": "POST", "path": "/v1/completions", "raw_path": b"/v1/completions",
+                 "query_string": b"", "http_version": "1.1", "scheme": "http", "root_path": "",
+                 "server": ("x", 80), "client": ("y", 1),
+                 "headers": [(b"content-type", b"application/json"), (b"content-length", b"10")]}  # the lie
+        await small_client.app(scope, receive, send)
+        return i
+
+    chunks_read = asyncio.run(drive())
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    assert status == 413, status
+    assert chunks_read <= max_body // len(chunk) + 2, f"read {chunks_read} chunks before stopping"

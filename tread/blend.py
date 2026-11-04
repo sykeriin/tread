@@ -138,9 +138,11 @@ def blend(model, ctx_ids, K, V, candidates, ratio, policy, gen=None, inplace=Fal
     Returns new (K, V) lists, the selected positions, and the effective recompute ratio in
     token-layers: deviation also pays for recomputing layer 0 over every candidate.
     """
+    K, V = list(K), list(V)
+    if not candidates:  # request with no documents: nothing to recompute
+        return K, V, torch.empty(0, dtype=torch.long, device=K[0].device), 0.0
     all_c = torch.cat(candidates)
     budget = int(round(ratio * len(all_c)))
-    K, V = list(K), list(V)
     if budget == 0:
         return K, V, all_c[:0], 0.0
     layers = model.model.layers
