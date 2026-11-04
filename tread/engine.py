@@ -42,8 +42,9 @@ class Engine:
             torch.cuda.synchronize()
 
     @torch.inference_mode()
-    def prefix_block(self, prefix_ids, st):
-        key = block_key(*self.sig, "prefix", prefix_ids)
+    def prefix_block(self, prefix_ids, st, namespace=""):
+        # Doc keys derive from this key, so a namespace isolates a tenant's whole block tree.
+        key = block_key(*self.sig, namespace, "prefix", prefix_ids)
         b = self.store.get(key)
         if b is None:
             st.misses += 1
@@ -95,7 +96,7 @@ class Engine:
         return blocks
 
     @torch.inference_mode()
-    def prefill(self, prefix_ids, docs, query_ids, ratio=0.0, policy="deviation"):
+    def prefill(self, prefix_ids, docs, query_ids, ratio=0.0, policy="deviation", namespace=""):
         """Build the context cache from blocks, optionally blend, run the query.
 
         Returns (logits of the last query position, DynamicCache for decoding, RequestStats).
@@ -104,7 +105,7 @@ class Engine:
         self._sync()
         t0 = time.perf_counter()
 
-        pkey, pb = self.prefix_block(prefix_ids, st)
+        pkey, pb = self.prefix_block(prefix_ids, st, namespace)
         Ks, Vs = [pb.K], [pb.V]
         offset = pb.n_tokens
         cands = []

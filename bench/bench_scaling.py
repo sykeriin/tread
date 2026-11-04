@@ -14,15 +14,14 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tread.engine import Engine, prefill_full  # noqa: E402
 from tread.store import BlockStore  # noqa: E402
+from workload import Workload  # noqa: E402
 
-SYSTEM = ("<|im_start|>system\nAnswer the question using the documents. "
-          "Reply with a short phrase only.<|im_end|>\n<|im_start|>user\n")
 METHODS = ["full", "prefix_cache", "cold", "tread_r0.0", "tread_r0.2", "tread_r0.5"]
 
 
@@ -48,13 +47,9 @@ def main():
     if free < need and not args.allow_low_vram:
         sys.exit(f"only {free} MiB VRAM free; timings would hit WDDM sysmem fallback (see bench/RESULTS.md)")
 
-    enc = lambda s: torch.tensor(tok(s, add_special_tokens=False).input_ids, device=dev)
-    pool_data = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation[1000:1400]")
-    pool = [enc(f"Document: {t}\n{''.join(s)}\n\n")
-            for ex in pool_data for t, s in zip(ex["context"]["title"], ex["context"]["sentences"])]
-    qs = load_dataset("hotpotqa/hotpot_qa", "distractor", split=f"validation[400:{400 + args.n}]")
-    prefix = enc(SYSTEM)
-    g = torch.Generator().manual_seed(0)
+    wl = Workload(tok, device=dev)
+    qs = Workload.questions(400, args.n)
+    prefix = wl.prefix
 
     results = {}
     for L in args.lengths:
@@ -63,19 +58,7 @@ def main():
         res = {m: dict(ttft=[], kl=[], top1=[]) for m in METHODS}
         ctx_lens = []
         for i, ex in enumerate(qs):
-            titles, sents = ex["context"]["title"], ex["context"]["sentences"]
-            gold = set(ex["supporting_facts"]["title"])
-            docs = [enc(f"Document: {t}\n{''.join(s)}\n\n") for t, s in zip(titles, sents) if t in gold]
-            # Pad with distractors from other questions up to the target length.
-            n_tok = len(prefix) + sum(len(d) for d in docs)
-            for j in torch.randperm(len(pool), generator=g).tolist():
-                if n_tok >= L:
-                    break
-                docs.append(pool[j])
-                n_tok += len(pool[j])
-            query = enc(f"Question: {ex['question']}<|im_end|>\n<|im_start|>assistant\n")
-            o1 = [docs[j] for j in torch.randperm(len(docs), generator=g)]
-            o2 = [docs[j] for j in torch.randperm(len(docs), generator=g)]
+            docs, query, o1, o2, n_tok = wl.request(ex, L)
             measured = i >= args.warmup
 
             def timed(fn, reps=args.reps):
