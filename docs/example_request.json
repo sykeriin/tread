@@ -1,0 +1,10 @@
+{
+  "prefix": "<|im_start|>system\nAnswer from the documents in a few words.<|im_end|>\n<|im_start|>user\n",
+  "documents": [
+    "Document: France\nThe capital of France is Paris.\n\n",
+    "Document: Japan\nThe capital of Japan is Tokyo.\n\n"
+  ],
+  "suffix": "Question: What is the capital of Japan?<|im_end|>\n<|im_start|>assistant\n",
+  "max_tokens": 16,
+  "recompute_ratio": 0.2
+}

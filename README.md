@@ -90,16 +90,14 @@ Serve it (binds to localhost; no auth, see the trust model in `tread/server.py`)
 ```
 
 ```bash
-curl -s localhost:8000/v1/completions -H 'content-type: application/json' -d '{"prefix":"<|im_start|>system
-Answer briefly.<|im_end|>
-<|im_start|>user
-","documents":["Document: A
-Paris is on the Seine.
-
-"],"suffix":"Question: Which river?<|im_end|>
-<|im_start|>assistant
-"}'
+curl -s localhost:8000/v1/completions -H 'content-type: application/json' -d @docs/example_request.json
 ```
+
+Send the same documents in the opposite order and every block is reused (`block_misses: 0`). On this tiny
+example (2 documents, 0.5B model) plain reuse (`"recompute_ratio": 0`) answers "Japan" and 20% recompute
+answers "Tokyo", which matches a full prefill. That is one illustration, not evidence: measured rates are in
+[docs/REPORT.md](docs/REPORT.md). The server decodes with plain greedy (no sampling, no repetition penalty), so its
+output matches a raw full-prefill argmax, not `model.generate()` with Qwen's default `repetition_penalty=1.1`.
 
 `bench_ttft.py` (fixed 8-document workload) is the older benchmark; its 1.5B results are invalid on a 4 GB card.
 

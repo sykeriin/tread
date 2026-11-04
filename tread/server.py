@@ -4,6 +4,9 @@ Requests carry their prompt as segments, [prefix][documents...][suffix], each to
 own. That is the API contract that makes chunk reuse well-defined (no tokenization-boundary
 ambiguity). The engine is single-GPU and not thread-safe, so requests are serialized with a lock.
 
+Decoding is plain greedy (no sampling, no repetition penalty), so output equals the argmax of a full prefill,
+not `model.generate()` with a model's default generation_config (Qwen2.5 sets repetition_penalty=1.1).
+
 Trust model: `prefix` and `suffix` are operator-controlled and may contain chat control tokens.
 `documents` are untrusted: control-token text in them stays plain text. There is no authentication,
 so the server binds to localhost by default. Reuse stats and timing reveal whether a document is
@@ -19,6 +22,7 @@ from typing import Annotated
 
 import torch
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StringConstraints
 
 from tread.engine import Engine
@@ -41,15 +45,69 @@ class CompletionRequest(BaseModel):
     policy: str = Field("deviation", pattern="^(deviation|boundary|random)$")
 
 
+class LockedTokenizer:
+    """Serializes all tokenizer use.
+
+    HF fast tokenizers write `encode_special_tokens` onto the shared Rust tokenizer on every call, so
+    concurrent calls with different `split_special_tokens` race: in testing, concurrent use failed with
+    tokenizer exceptions, and the same shared flag could let untrusted text be parsed as control tokens.
+    Every encode/decode takes this lock and the flag is passed explicitly on every call.
+    """
+
+    def __init__(self, tok):
+        self.tok, self._lock = tok, threading.Lock()
+
+    def encode(self, text, untrusted=False):
+        with self._lock:
+            return self.tok(text, add_special_tokens=False, split_special_tokens=untrusted).input_ids
+
+    def decode(self, ids):
+        with self._lock:
+            return self.tok.decode(ids)
+
+
+# A token covers at least one character in any sane vocabulary and ~4 on English text; 32 is a loose upper
+# bound on chars/token that still rejects multi-megabyte inputs before they are tokenized.
+MAX_CHARS_PER_TOKEN = 32
+# JSON escapes non-ASCII as \uXXXX (6 bytes/char), so a body can be ~6x its character count.
+MAX_BODY_BYTES_PER_CHAR = 6
+
+
 def build_app(model, tok, engine: Engine, eos_ids, max_context=16384):
     app = FastAPI(title="tread")
     lock = threading.Lock()
+    tk = LockedTokenizer(tok)
     counters = dict(requests=0, ttft_ms_sum=0.0, tokens_reused=0, tokens_prefilled=0, generated_tokens=0)
     dev = next(model.parameters()).device
+    max_chars = max_context * MAX_CHARS_PER_TOKEN
+    max_body = max_chars * MAX_BODY_BYTES_PER_CHAR + (1 << 16)
 
-    def enc(s, untrusted=False):
-        ids = tok(s, add_special_tokens=False, split_special_tokens=untrusted).input_ids
-        return torch.tensor(ids, dtype=torch.long, device=dev)
+    @app.middleware("http")
+    async def cap_body(request, call_next):
+        # Reject on the declared length before the body is read or parsed. Chunked uploads (no length) are refused.
+        if request.method == "POST":
+            n = request.headers.get("content-length")
+            if n is None:
+                return JSONResponse({"detail": "Content-Length required"}, status_code=411)
+            if not n.isdigit() or int(n) > max_body:
+                return JSONResponse({"detail": f"body exceeds {max_body} bytes"}, status_code=413)
+        return await call_next(request)
+
+    def tokenize(req):
+        """All segments to token-id lists, with every size limit enforced before any tensor is allocated."""
+        segments = [(req.prefix, False)] + [(d, True) for d in req.documents] + [(req.suffix, False)]
+        if sum(len(s) for s, _ in segments) > max_chars:
+            raise HTTPException(413, f"prompt exceeds {max_chars} characters")
+        budget, out = max_context - req.max_tokens, []
+        for text, untrusted in segments:
+            ids = tk.encode(text, untrusted)
+            budget -= len(ids)
+            if budget < 0:  # stop as soon as the running total is over the limit
+                raise HTTPException(413, f"prompt + {req.max_tokens} new tokens exceeds limit {max_context}")
+            out.append(ids)
+        return out
+
+    app.state.tokenize, app.state.tk = tokenize, tk  # exposed for tests
 
     @app.get("/health")
     def health():
@@ -57,10 +115,10 @@ def build_app(model, tok, engine: Engine, eos_ids, max_context=16384):
 
     @app.post("/v1/completions")
     def complete(req: CompletionRequest):
-        prefix, docs, suffix = enc(req.prefix), [enc(d, untrusted=True) for d in req.documents], enc(req.suffix)
-        n_prompt = len(prefix) + sum(map(len, docs)) + len(suffix)
-        if n_prompt + req.max_tokens > max_context:
-            raise HTTPException(413, f"{n_prompt} prompt + {req.max_tokens} new tokens exceeds limit {max_context}")
+        ids = tokenize(req)
+        n_prompt = sum(map(len, ids))
+        as_tensor = lambda x: torch.tensor(x, dtype=torch.long, device=dev)
+        prefix, docs, suffix = as_tensor(ids[0]), [as_tensor(d) for d in ids[1:-1]], as_tensor(ids[-1])
         with lock, torch.inference_mode():
             t0 = time.perf_counter()
             logits, cache, st = engine.prefill(prefix, docs, suffix, ratio=req.recompute_ratio, policy=req.policy,
@@ -72,13 +130,13 @@ def build_app(model, tok, engine: Engine, eos_ids, max_context=16384):
                 o = model(nxt.view(1, 1), past_key_values=cache, use_cache=True, num_logits_to_keep=1)
                 cache, nxt = o.past_key_values, o.logits[0, -1].argmax()
             total = time.perf_counter() - t0
-        counters["requests"] += 1
-        counters["ttft_ms_sum"] += st.t["ttft"] * 1000
-        counters["tokens_reused"] += st.tokens_reused
-        counters["tokens_prefilled"] += st.tokens_prefilled
-        counters["generated_tokens"] += len(out)
+            counters["requests"] += 1
+            counters["ttft_ms_sum"] += st.t["ttft"] * 1000
+            counters["tokens_reused"] += st.tokens_reused
+            counters["tokens_prefilled"] += st.tokens_prefilled
+            counters["generated_tokens"] += len(out)
         return {
-            "text": tok.decode(out),
+            "text": tk.decode(out),
             "usage": {"prompt_tokens": n_prompt, "completion_tokens": len(out)},
             "tread": {"block_hits": st.hits, "block_misses": st.misses, "tokens_reused": st.tokens_reused,
                       "tokens_prefilled": st.tokens_prefilled, "recompute_eff": round(st.recompute_eff, 4),
