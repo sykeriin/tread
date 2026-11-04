@@ -10,8 +10,11 @@ recomputed. tread caches each chunk as a content-addressed block, shifts it to i
 with an exact RoPE rotation, and optionally recomputes a small, selected subset of tokens to repair
 the cross-chunk attention that independent caching misses.
 
-Status: Phase 1 (reuse engine + TTFT benchmark) in progress. See [SCOPE.md](SCOPE.md) for the
-plan and [phase0/RESULTS.md](phase0/RESULTS.md) for the feasibility study.
+Status: working engine, HTTP server, tests, and a laptop-scale benchmark. Large-model timings and the
+vLLM / llama.cpp comparison are **not yet run** (scripts in `bench/cloud/`, untested).
+See [docs/REPORT.md](docs/REPORT.md) (technical report, draft), [docs/BLOG.md](docs/BLOG.md) (blog draft),
+[SCOPE.md](SCOPE.md) (original plan), [phase0/RESULTS.md](phase0/RESULTS.md) and
+[bench/RESULTS.md](bench/RESULTS.md) (raw results, including invalid runs).
 
 ## How it works
 
@@ -32,17 +35,24 @@ query ─────────► normal forward over the assembled cache →
   This halves the reuse error (attention-sink effect; Phase 0).
 - **Selective recompute.** Picks the tokens whose layer-1 KV drifts most from a fresh pass, and
   recomputes them through every layer against the reused cache (CacheBlend-style).
-- **Block store.** Content-addressed, byte budget, LRU eviction.
+- **Block store.** Content-addressed, GPU byte budget with LRU, spilling to a pinned-CPU tier; per-tenant namespaces.
+- **Cold path.** Missed documents are prefilled together in one packed forward (block-diagonal mask).
+- **Optional CUDA graphs** for the recompute loop at contexts of 2k tokens or less.
 
 ## Layout
 
 | path | what |
 |---|---|
 | `tread/blend.py` | RoPE re-rotation, chunk prefill, selective recompute |
-| `tread/store.py` | content-addressed block store with budget + LRU |
+| `tread/store.py` | content-addressed block store: GPU + pinned-CPU tiers, budgets, LRU |
 | `tread/engine.py` | request assembly, plus full-prefill and exact-prefix baselines |
+| `tread/graphs.py` | CUDA-graph replay of the recompute layer loop |
+| `tread/server.py` | FastAPI server: `POST /v1/completions` (segments), `GET /metrics` |
 | `tests/` | correctness tests (exactness, cache hits, eviction) |
-| `bench/bench_ttft.py` | TTFT benchmark on a reordered-RAG workload |
+| `bench/bench_ttft.py`, `bench_scaling.py` | TTFT / quality benchmarks on a reordered-RAG workload (k docs, 1k-16k tokens) |
+| `bench/workload.py` | the shared workload generator (all systems see identical tokens) |
+| `bench/baselines.py`, `bench/cloud/` | vLLM / llama.cpp baselines + one-command GPU run (untested) |
+| `docs/` | technical report and blog draft |
 | `phase0/` | feasibility study: quality vs recompute, predictor and held-out experiments |
 
 ## Setup
@@ -70,8 +80,28 @@ python -m venv .venv
 ```
 
 ```bash
-.venv/Scripts/python bench/bench_ttft.py --model Qwen/Qwen2.5-1.5B-Instruct --dtype float16 --n 50 --k 8
+.venv/Scripts/python bench/bench_scaling.py --model Qwen/Qwen2.5-0.5B-Instruct --lengths 1000 2000 4000 8000 --n 15
 ```
+
+Serve it (binds to localhost; no auth, see the trust model in `tread/server.py`):
+
+```bash
+.venv/Scripts/python -m tread.server --model Qwen/Qwen2.5-0.5B-Instruct --port 8000
+```
+
+```bash
+curl -s localhost:8000/v1/completions -H 'content-type: application/json' -d '{"prefix":"<|im_start|>system
+Answer briefly.<|im_end|>
+<|im_start|>user
+","documents":["Document: A
+Paris is on the Seine.
+
+"],"suffix":"Question: Which river?<|im_end|>
+<|im_start|>assistant
+"}'
+```
+
+`bench_ttft.py` (fixed 8-document workload) is the older benchmark; its 1.5B results are invalid on a 4 GB card.
 
 ## Findings so far (Qwen2.5, HotpotQA)
 
@@ -83,3 +113,6 @@ python -m venv .venv
 - Adaptive per-request recompute budgets looked promising in-sample but **did not replicate on
   held-out data**. See phase0/RESULTS.md, Phase 0e.
 - Partial recompute is not monotone per request: on some requests it is worse than plain reuse.
+- Latency (0.5B, laptop, same-codebase baselines): plain reuse 1.9x / 3.1x / 5.8x faster than full prefill at 2k / 4k / 8k
+  tokens, 20% recompute 1.4-1.6x faster at 4-8k (slower below 2k), with first-token top-1 agreement of 69-92%
+  at 20% recompute. These are small-model, small-n numbers; see the Limitations in docs/REPORT.md.

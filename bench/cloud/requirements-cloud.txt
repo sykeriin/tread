@@ -1,0 +1,10 @@
+# Linux + CUDA GPU box (A100 / L40S / 4090). Install torch for your CUDA first; vLLM pins its own torch,
+# so use a SEPARATE venv for vLLM and for tread.
+#
+# venv A (tread):  -r ../../requirements.txt
+# venv B (vllm):
+vllm==0.6.6.post1
+transformers==4.46.3
+datasets==3.1.0
+# venv C (llama.cpp), build with CUDA:  CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python==0.3.5
+llama-cpp-python==0.3.5
