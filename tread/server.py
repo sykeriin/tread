@@ -8,20 +8,25 @@ Decoding is plain greedy (no sampling, no repetition penalty), so output equals 
 not `model.generate()` with a model's default generation_config (Qwen2.5 sets repetition_penalty=1.1).
 
 Trust model: `prefix` and `suffix` are operator-controlled and may contain chat control tokens.
-`documents` are untrusted: control-token text in them stays plain text. There is no authentication,
-so the server binds to localhost by default. Reuse stats and timing reveal whether a document is
+`documents` are untrusted: control-token text in them stays plain text. Authentication is an optional
+shared bearer token (`--api-key`); without it the server binds to localhost by default. Reuse stats and timing reveal whether a document is
 already cached, so a shared deployment must sit behind an authenticating proxy that sets `tenant`
 itself: blocks are never reused across tenants.
+
+Load limits: at most `max_queue` requests may be in flight (running or waiting for the GPU lock); more get 429.
+A request that waits longer than `queue_timeout` s for the lock gets 503, and decoding stops at `max_seconds`
+(the response then has finish_reason "time"). A prefill that has started cannot be interrupted.
 
 Run: .venv/Scripts/python -m tread.server --model Qwen/Qwen2.5-0.5B-Instruct --port 8000
 """
 import argparse
+import hmac
 import threading
 import time
 from typing import Annotated
 
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StringConstraints
 
@@ -123,9 +128,18 @@ MAX_CHARS_PER_TOKEN = 32
 MAX_BODY_BYTES_PER_CHAR = 6
 
 
-def build_app(model, tok, engine: Engine, eos_ids, max_context=16384):
-    app = FastAPI(title="tread")
+def build_app(model, tok, engine: Engine, eos_ids, max_context=16384, api_key=None, max_queue=16,
+              queue_timeout=30.0, max_seconds=120.0):
+    def auth(request: Request):
+        if api_key is None:
+            return
+        got = request.headers.get("authorization", "")
+        if not hmac.compare_digest(got.encode(), f"Bearer {api_key}".encode()):
+            raise HTTPException(401, "invalid or missing bearer token", headers={"WWW-Authenticate": "Bearer"})
+
+    app = FastAPI(title="tread", dependencies=[Depends(auth)])
     lock = threading.Lock()
+    slots = threading.BoundedSemaphore(max_queue)
     tk = LockedTokenizer(tok)
     counters = dict(requests=0, ttft_ms_sum=0.0, tokens_reused=0, tokens_prefilled=0, generated_tokens=0)
     dev = next(model.parameters()).device
@@ -156,17 +170,42 @@ def build_app(model, tok, engine: Engine, eos_ids, max_context=16384):
 
     @app.post("/v1/completions")
     def complete(req: CompletionRequest):
+        if not slots.acquire(blocking=False):
+            raise HTTPException(429, f"server busy: {max_queue} requests already in flight",
+                                headers={"Retry-After": "1"})
+        try:
+            return run(req)
+        finally:
+            slots.release()
+
+    def run(req):
         ids = tokenize(req)
         n_prompt = sum(map(len, ids))
         as_tensor = lambda x: torch.tensor(x, dtype=torch.long, device=dev)
         prefix, docs, suffix = as_tensor(ids[0]), [as_tensor(d) for d in ids[1:-1]], as_tensor(ids[-1])
-        with lock, torch.inference_mode():
+        if not lock.acquire(timeout=queue_timeout):
+            raise HTTPException(503, f"timed out after {queue_timeout}s waiting for the GPU",
+                                headers={"Retry-After": "5"})
+        try:
+            return generate(req, ids, n_prompt, prefix, docs, suffix)
+        finally:
+            lock.release()
+
+    def generate(req, ids, n_prompt, prefix, docs, suffix):
+        with torch.inference_mode():
             t0 = time.perf_counter()
             logits, cache, st = engine.prefill(prefix, docs, suffix, ratio=req.recompute_ratio, policy=req.policy,
                                                namespace=req.tenant)
             out = []
             nxt = logits.argmax()
-            while nxt.item() not in eos_ids and len(out) < req.max_tokens:
+            reason = "stop"
+            while nxt.item() not in eos_ids:
+                if len(out) >= req.max_tokens:
+                    reason = "length"
+                    break
+                if time.perf_counter() - t0 > max_seconds:
+                    reason = "time"
+                    break
                 out.append(nxt.item())
                 o = model(nxt.view(1, 1), past_key_values=cache, use_cache=True, num_logits_to_keep=1)
                 cache, nxt = o.past_key_values, o.logits[0, -1].argmax()
@@ -178,6 +217,7 @@ def build_app(model, tok, engine: Engine, eos_ids, max_context=16384):
             counters["generated_tokens"] += len(out)
         return {
             "text": tk.decode(out),
+            "finish_reason": reason,
             "usage": {"prompt_tokens": n_prompt, "completion_tokens": len(out)},
             "tread": {"block_hits": st.hits, "block_misses": st.misses, "tokens_reused": st.tokens_reused,
                       "tokens_prefilled": st.tokens_prefilled, "recompute_eff": round(st.recompute_eff, 4),
@@ -209,13 +249,19 @@ def main():
     ap.add_argument("--graphs", action="store_true", help="CUDA-graph recompute for contexts <= 2k tokens")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--api-key", default=None, help="require 'Authorization: Bearer <key>' on every route")
+    ap.add_argument("--max-queue", type=int, default=16)
+    ap.add_argument("--queue-timeout", type=float, default=30.0)
+    ap.add_argument("--max-seconds", type=float, default=120.0)
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=getattr(torch, args.dtype)).to("cuda").eval()
     engine = Engine(model, BlockStore(args.gpu_mb << 20, args.cpu_mb << 20), graphs=args.graphs)
     eos = {tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>")}
-    uvicorn.run(build_app(model, tok, engine, eos), host=args.host, port=args.port)
+    app = build_app(model, tok, engine, eos, api_key=args.api_key, max_queue=args.max_queue,
+                    queue_timeout=args.queue_timeout, max_seconds=args.max_seconds)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

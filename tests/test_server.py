@@ -269,3 +269,55 @@ def test_body_cap_counts_received_bytes_not_the_header(small_client):
     status = next(m["status"] for m in sent if m["type"] == "http.response.start")
     assert status == 413, status
     assert chunks_read <= max_body // len(chunk) + 2, f"read {chunks_read} chunks before stopping"
+
+
+def _app(mt, **kw):
+    model, tok, eos = mt
+    return build_app(model, tok, Engine(model, BlockStore(1 << 30)), eos, **kw)
+
+
+def _body():
+    return dict(prefix=PREFIX, documents=DOCS, suffix=SUFFIX, max_tokens=8)
+
+
+def test_api_key_is_required_when_configured(mt):
+    c = TestClient(_app(mt, api_key="s3cret"))
+    assert c.post("/v1/completions", json=_body()).status_code == 401
+    assert c.get("/metrics").status_code == 401
+    assert c.get("/health", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert c.get("/health", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    ok = c.post("/v1/completions", json=_body(), headers={"Authorization": "Bearer s3cret"})
+    assert ok.status_code == 200
+
+
+def test_full_queue_returns_429(mt):
+    c = TestClient(_app(mt, max_queue=1))
+    # Hold the only slot by wrapping the app's route: acquire via a stuck request is racy, so exhaust it directly.
+    slots = next(r for r in c.app.routes if r.path == "/v1/completions").endpoint.__closure__
+    sem = next(cell.cell_contents for cell in slots if type(cell.cell_contents).__name__ == "BoundedSemaphore")
+    assert sem.acquire(blocking=False)
+    try:
+        r = c.post("/v1/completions", json=_body())
+        assert r.status_code == 429 and r.headers["retry-after"]
+    finally:
+        sem.release()
+    assert c.post("/v1/completions", json=_body()).status_code == 200
+
+
+def test_lock_wait_times_out_with_503(mt):
+    c = TestClient(_app(mt, queue_timeout=0.2))
+    closure = next(r for r in c.app.routes if r.path == "/v1/completions").endpoint.__closure__
+    # `complete` closes over slots/run; the GPU lock is reachable through run's closure.
+    run = next(cell.cell_contents for cell in closure if getattr(cell.cell_contents, "__name__", "") == "run")
+    lock = next(cell.cell_contents for cell in run.__closure__ if type(cell.cell_contents).__name__ == "lock")
+    lock.acquire()
+    try:
+        assert c.post("/v1/completions", json=_body()).status_code == 503
+    finally:
+        lock.release()
+
+
+def test_decode_stops_at_time_budget(mt):
+    c = TestClient(_app(mt, max_seconds=0.0))
+    r = c.post("/v1/completions", json={**_body(), "max_tokens": 64})
+    assert r.status_code == 200 and r.json()["finish_reason"] == "time"
