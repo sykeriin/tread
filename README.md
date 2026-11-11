@@ -16,6 +16,28 @@ See [docs/REPORT.md](docs/REPORT.md) (technical report, draft), [docs/BLOG.md](d
 [SCOPE.md](SCOPE.md) (original plan), [phase0/RESULTS.md](phase0/RESULTS.md) and
 [bench/RESULTS.md](bench/RESULTS.md) (raw results, including invalid runs).
 
+## At a glance
+
+**Skipping the prefill gets more valuable the longer the context.** When the same documents return in a
+different order, plain reuse answers in about the same time at 1k tokens and 5.8x faster at 8k.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/latency-dark.png">
+  <img src="docs/img/latency-light.png" width="760" alt="Time to first token vs context length for full prefill, tread with 20% recompute, and tread plain reuse. At 8k tokens: 841 ms, 516 ms and 146 ms.">
+</picture>
+
+**But reuse is not free.** A chunk cached on its own never saw the chunks before it, so the output drifts
+from a full prefill. Recomputing a selected 20% of document tokens removes about 60% of that drift, and
+100% reproduces full prefill exactly. That trade-off is the whole project.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/quality-dark.png">
+  <img src="docs/img/quality-light.png" width="760" alt="KL divergence from full prefill vs share of document tokens recomputed: 0.263 with none, 0.099 at 20%, 0.029 at 50%, zero at 100%.">
+</picture>
+
+Both figures are small-model, laptop-GPU results, and they come from different models and context lengths,
+so they do not combine into one speed-for-quality number. Regenerate them with `bench/plot_readme.py`.
+
 ## How it works
 
 ```
@@ -52,7 +74,8 @@ query ─────────► normal forward over the assembled cache →
 | `bench/bench_ttft.py`, `bench_scaling.py` | TTFT / quality benchmarks on a reordered-RAG workload (k docs, 1k-16k tokens) |
 | `bench/workload.py` | the shared workload generator (all systems see identical tokens) |
 | `bench/baselines.py`, `bench/cloud/` | vLLM / llama.cpp baselines + one-command GPU run (untested) |
-| `docs/` | technical report and blog draft |
+| `bench/plot_readme.py` | renders the figures in this README from the committed result files |
+| `docs/` | technical report, blog draft, and `img/` (README figures) |
 | `phase0/` | feasibility study: quality vs recompute, predictor and held-out experiments |
 
 ## Setup
@@ -114,3 +137,16 @@ output matches a raw full-prefill argmax, not `model.generate()` with Qwen's def
 - Latency (0.5B, laptop, same-codebase baselines): plain reuse 1.9x / 3.1x / 5.8x faster than full prefill at 2k / 4k / 8k
   tokens, 20% recompute 1.4-1.6x faster at 4-8k (slower below 2k), with first-token top-1 agreement of 69-92%
   at 20% recompute. These are small-model, small-n numbers; see the Limitations in docs/REPORT.md.
+
+## The benchmark that lied
+
+The first 1.5B run reported tread as 15x faster than full prefill. It was not. The 4 GB card had 19 MiB
+free, and Windows (WDDM) silently spills GPU memory into system RAM instead of failing. The large
+full-prefill passes slowed 3-9x and varied wildly between requests; tread's small passes barely
+noticed. The benchmarks now refuse to run without free VRAM headroom, and the invalid runs stay in the repo
+as a warning to anyone timing GPU code on consumer Windows hardware.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/vram-spill-dark.png">
+  <img src="docs/img/vram-spill-light.png" width="760" alt="Per-request time to first token in the invalid run: full prefill scattered from 275 ms to 3.4 s (median 1,545 ms), tread plain reuse clustered near 106 ms.">
+</picture>

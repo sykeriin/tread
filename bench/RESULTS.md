@@ -90,6 +90,13 @@ once per layer.
 - Tried and reverted: `F.scaled_dot_product_attention(..., enable_gqa=True)` to avoid `repeat_kv`
   copies. With a boolean mask, torch 2.5 falls back to the math kernel. It was 3× slower at 4k and ran out of memory at 8k
   (3.4 GB attention matrix).
+- Tried and reverted: removing the `repeat_kv` copies without `enable_gqa`, by folding each KV group's
+  query heads into the query axis (`q` as `[1, kv_heads, groups*n, d]`) or into the batch axis (K/V
+  expanded as views). Outputs are bit-identical to `repeat_kv`. Blend time, 0.5B fp16, deviation policy,
+  median of 5, old vs new: batch-axis fold 179 vs 177 ms (4k, 20%), 467 vs 458 ms (8k, 20%), 1001 vs
+  996 ms (8k, 50%), i.e. within noise, with ~50-90 MiB higher peak memory. The query-axis fold was 8-17%
+  slower and peaked 1.1 GB higher at 8k, because the mask has to be materialised `groups` times. So the
+  KV copies are not the bottleneck at long context; the attention itself is.
 
 ## CUDA graphs for the recompute loop (`tread/graphs.py`, `Engine(..., graphs=True)`)
 
@@ -116,8 +123,8 @@ Blend-stage time, 0.5B fp16, median of 5 after capture:
 - Each new bucket pays a one-off capture of 0.5–2 s, so graphs suit steady traffic with repeated
   shapes, not one-shot benchmarks.
 - What would help at long context: assembling blocks *directly* into the static buffer (removes
-  the copy-in), and avoiding `repeat_kv`'s 7× KV copies per layer with a GQA-aware masked attention
-  kernel.
+  the copy-in). Avoiding `repeat_kv`'s 7× KV copies per layer was tested later and did not help
+  (see "Tried and reverted" above).
 
 ## Next steps (in order of expected payoff)
 1. **Find the crossover context length.** Build longer contexts (e.g. 20–40 docs, 4–8k tokens) where
